@@ -4,7 +4,7 @@ import pandas as pd
 from datetime import date, datetime
 from PIL import Image
 
-logo = Image.open("medica_logo.png")
+logo = Image.open("medica_logo.PNG")
 st.set_page_config(
     page_title="Grant Opportunity Explorer",
     page_icon=logo,
