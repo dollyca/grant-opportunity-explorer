@@ -1,10 +1,21 @@
-import re
 import streamlit as st
 import pandas as pd
-from datetime import date, datetime
+from datetime import date
+from pathlib import Path
 from PIL import Image
+from openpyxl import load_workbook
 
-logo = Image.open("medica_logo.PNG")
+
+# --------------------------------------------------
+# Page setup
+# --------------------------------------------------
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_FILE = BASE_DIR / "data" / "Grant Database - Backup.xlsx"
+LOGO_FILE = BASE_DIR / "medica_logo.PNG"
+
+logo = Image.open(LOGO_FILE)
+
 st.set_page_config(
     page_title="Grant Opportunity Explorer",
     page_icon=logo,
@@ -13,17 +24,26 @@ st.set_page_config(
 
 
 # --------------------------------------------------
-# Data cleaning functions
+# Helpers
 # --------------------------------------------------
 
-def clean_text_column(series):
-    """
-    Remove extra spaces while preserving missing values.
+CORE_COLUMNS = [
+    "Funder Name",
+    "Program Name",
+    "Website Link",
+    "Funding Type",
+    "Focus Area",
+    "Grant Size",
+    "Eligibility",
+    "Deadline",
+    "Deadline Type",
+    "Geographic Scope",
+    "Notes (Fit with Medica Zone's Mission)",
+]
 
-    Examples:
-    "  Federal Grant  " -> "Federal Grant"
-    "Mental   Health"   -> "Mental Health"
-    """
+
+def clean_text(series):
+    """Trim extra whitespace while preserving missing values."""
     return (
         series.astype("string")
         .str.strip()
@@ -32,340 +52,82 @@ def clean_text_column(series):
     )
 
 
-def clean_funding_type(df):
+def extract_excel_hyperlinks(file_path, sheet_name):
     """
-    Standardize common Funding Type variations.
-
-    Add more mappings later only when actual duplicate
-    categories appear in the Excel file.
+    Read the actual hyperlink targets stored in the Excel Website Link column.
+    Pandas normally reads only the visible cell text.
     """
-    if "Funding Type" not in df.columns:
-        return df
+    workbook = load_workbook(file_path, data_only=False)
+    worksheet = workbook[sheet_name]
 
-    df["Funding Type"] = clean_text_column(df["Funding Type"])
-
-    mapping = {
-        "federal": "Federal",
-        "federal grant": "Federal",
-        "federal funding": "Federal",
-        "government": "Government",
-        "government grant": "Government",
-        "state": "State",
-        "state grant": "State",
-        "local": "Local",
-        "local grant": "Local",
-        "foundation": "Foundation",
-        "foundation grant": "Foundation",
-        "corporate": "Corporate",
-        "corporate grant": "Corporate",
-        "private": "Private",
-        "private grant": "Private",
-        "nonprofit": "Nonprofit",
+    headers = {
+        str(cell.value).strip(): index
+        for index, cell in enumerate(worksheet[1], start=1)
+        if cell.value is not None
     }
 
-    normalized = df["Funding Type"].str.lower()
+    website_col = headers.get("Website Link")
 
-    df["Funding Type"] = normalized.map(mapping).fillna(
-        df["Funding Type"]
-    )
+    if website_col is None:
+        return []
 
-    return df
+    links = []
 
+    for row_number in range(2, worksheet.max_row + 1):
+        cell = worksheet.cell(row=row_number, column=website_col)
 
-def clean_focus_area(df):
-    """
-    Clean spacing and standardize a few obvious Focus Area variations.
-    """
-    if "Focus Area" not in df.columns:
-        return df
-
-    df["Focus Area"] = clean_text_column(df["Focus Area"])
-
-    mapping = {
-        "mental health": "Mental Health",
-        "behavioral health": "Behavioral Health",
-        "behavioural health": "Behavioral Health",
-        "health care": "Healthcare",
-        "healthcare": "Healthcare",
-        "public health": "Public Health",
-        "community health": "Community Health",
-        "workforce development": "Workforce Development",
-        "economic development": "Economic Development",
-        "education": "Education",
-        "housing": "Housing",
-        "homelessness": "Homelessness",
-        "food insecurity": "Food Insecurity",
-        "social services": "Social Services",
-    }
-
-    normalized = df["Focus Area"].str.lower()
-
-    df["Focus Area"] = normalized.map(mapping).fillna(
-        df["Focus Area"]
-    )
-
-    return df
-
-
-def clean_geographic_scope(df):
-    """
-    Standardize common geographic abbreviations and variations.
-    """
-    if "Geographic Scope" not in df.columns:
-        return df
-
-    df["Geographic Scope"] = clean_text_column(
-        df["Geographic Scope"]
-    )
-
-    mapping = {
-        "ca": "California",
-        "calif": "California",
-        "calif.": "California",
-        "california": "California",
-        "us": "National",
-        "u.s.": "National",
-        "usa": "National",
-        "u.s.a.": "National",
-        "united states": "National",
-        "nationwide": "National",
-        "national": "National",
-        "orange county": "Orange County",
-        "orange county, ca": "Orange County",
-        "southern california": "Southern California",
-        "southern ca": "Southern California",
-        "regional": "Regional",
-        "local": "Local",
-    }
-
-    normalized = df["Geographic Scope"].str.lower()
-
-    df["Geographic Scope"] = normalized.map(mapping).fillna(
-        df["Geographic Scope"]
-    )
-
-    return df
-
-
-def clean_website(df):
-    """
-    Clean website links and add https:// when the protocol is missing.
-    """
-    if "Website Link" not in df.columns:
-        return df
-
-    def fix_url(value):
-        if pd.isna(value):
-            return pd.NA
-
-        url = str(value).strip()
-
-        if not url:
-            return pd.NA
-
-        if url.lower() in {
-            "n/a",
-            "na",
-            "none",
-            "not available",
-            "unknown",
-        }:
-            return pd.NA
-
-        if not url.lower().startswith(
+        if cell.hyperlink and cell.hyperlink.target:
+            links.append(cell.hyperlink.target)
+        elif isinstance(cell.value, str) and cell.value.startswith(
             ("http://", "https://")
         ):
-            url = "https://" + url
+            links.append(cell.value.strip())
+        else:
+            links.append(pd.NA)
 
-        return url
-
-    df["Website Link"] = df["Website Link"].apply(fix_url)
-
-    return df
+    return links
 
 
-def clean_general_text_columns(df):
+def prepare_deadlines(df):
     """
-    Clean extra spaces in the remaining text columns.
-    """
-    text_columns = [
-        "Funder Name",
-        "Program Name",
-        "Grant Size",
-        "Eligibility",
-        "Notes (Fit with Medica Zone's Mission)",
-    ]
-
-    for column in text_columns:
-        if column in df.columns:
-            df[column] = clean_text_column(df[column])
-
-    return df
-
-
-def clean_deadline(df):
-    """
-    Preserve text deadlines such as Rolling, September, and application
-    instructions. Parse only genuine full calendar dates.
+    Deadline contains actual calendar dates only.
+    Deadline Type stores the timing rule:
+    Fixed, Rolling, Multiple, Annual, Estimated, or Varies.
     """
     if "Deadline" not in df.columns:
-        df["Deadline Raw"] = pd.NA
-        df["Deadline Parsed"] = pd.NaT
-        df["Deadline Display"] = ""
-        df["Days Until Deadline"] = pd.NA
-        df["Deadline Status"] = "Missing deadline"
-        return df
+        df["Deadline"] = pd.NaT
 
-    df["Deadline Raw"] = df["Deadline"].copy()
+    if "Deadline Type" not in df.columns:
+        df["Deadline Type"] = pd.NA
 
-    month_names = {
-        1: "January",
-        2: "February",
-        3: "March",
-        4: "April",
-        5: "May",
-        6: "June",
-        7: "July",
-        8: "August",
-        9: "September",
-        10: "October",
-        11: "November",
-        12: "December",
-    }
-
-    def parse_deadline(value):
-        if pd.isna(value):
-            return pd.NaT
-
-        # Excel may store a month-only value as a date in year 0001.
-        if isinstance(value, (pd.Timestamp, datetime)):
-            if value.year < 1900:
-                return pd.NaT
-            return pd.Timestamp(value)
-
-        # Handle genuine Excel serial dates.
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            if 20000 <= value <= 80000:
-                return (
-                    pd.Timestamp("1899-12-30")
-                    + pd.to_timedelta(value, unit="D")
-                )
-
-            return pd.NaT
-
-        text = str(value).strip()
-
-        if not text:
-            return pd.NaT
-
-        lowered = text.lower()
-
-        if lowered in {
-            "nan",
-            "nat",
-            "none",
-            "n/a",
-            "na",
-            "unknown",
-            "rolling",
-            "ongoing",
-            "annual",
-            "annually",
-            "monthly",
-            "quarterly",
-            "open",
-            "january",
-            "february",
-            "march",
-            "april",
-            "may",
-            "june",
-            "july",
-            "august",
-            "september",
-            "october",
-            "november",
-            "december",
-        }:
-            return pd.NaT
-
-        # Do not parse text unless it contains a real four-digit year.
-        if not pd.Series([text]).str.contains(
-            r"\b(?:19|20)\d{2}\b",
-            regex=True,
-        ).iloc[0]:
-            return pd.NaT
-
-        parsed = pd.to_datetime(text, errors="coerce")
-
-        if pd.notna(parsed) and parsed.year >= 1900:
-            return parsed
-
-        return pd.NaT
-
-    def display_deadline(value, parsed_value):
-        if pd.notna(parsed_value):
-            return parsed_value.strftime("%m/%d/%Y")
-
-        if pd.isna(value):
-            return ""
-
-        # Convert fake year-0001 dates back into month names.
-        if isinstance(value, (pd.Timestamp, datetime)):
-            if value.year < 1900:
-                return month_names.get(value.month, "")
-
-        text = str(value).strip()
-
-        # Also handle cases converted into text before reaching this function.
-        fake_date_match = re.fullmatch(
-            r"0*1-(\d{1,2})-\d{1,2}(?:\s+00:00:00)?",
-            text,
-        )
-
-        if fake_date_match:
-            month_number = int(fake_date_match.group(1))
-            return month_names.get(month_number, text)
-
-        if text.lower() in {
-            "",
-            "nan",
-            "nat",
-            "none",
-            "n/a",
-            "na",
-        }:
-            return ""
-
-        return text
-
-    df["Deadline Parsed"] = df["Deadline Raw"].apply(
-        parse_deadline
+    df["Deadline"] = pd.to_datetime(
+        df["Deadline"],
+        errors="coerce",
     )
 
-    df["Deadline Display"] = df.apply(
-        lambda row: display_deadline(
-            row["Deadline Raw"],
-            row["Deadline Parsed"],
-        ),
-        axis=1,
+    df["Deadline Type"] = clean_text(df["Deadline Type"])
+
+    df["Deadline Display"] = (
+        df["Deadline"]
+        .dt.strftime("%m/%d/%Y")
+        .fillna("")
     )
 
     today = pd.Timestamp(date.today())
 
     df["Days Until Deadline"] = (
-        df["Deadline Parsed"].dt.normalize() - today
+        df["Deadline"].dt.normalize() - today
     ).dt.days
 
     def classify_deadline(row):
+        deadline = row["Deadline"]
+        deadline_type = row["Deadline Type"]
         days = row["Days Until Deadline"]
-        display = row["Deadline Display"]
 
-        if not display:
+        if pd.isna(deadline):
+            if pd.notna(deadline_type):
+                return str(deadline_type)
             return "Missing deadline"
-
-        if pd.isna(days):
-            return "No fixed date"
 
         if days < 0:
             return "Past deadline"
@@ -389,18 +151,51 @@ def clean_deadline(df):
     return df
 
 
-def clean_data(df):
+def add_missing_information_flag(df):
     """
-    Run all lightweight cleaning steps.
+    Flag rows that have at least one blank field in the core source data.
+    Deadline is treated as complete when Deadline Type explains why
+    no exact date exists (for example Rolling or Varies).
     """
-    df = df.copy()
+    columns_to_check = [
+        column
+        for column in CORE_COLUMNS
+        if column in df.columns
+    ]
 
-    df = clean_general_text_columns(df)
-    df = clean_funding_type(df)
-    df = clean_focus_area(df)
-    df = clean_geographic_scope(df)
-    df = clean_website(df)
-    df = clean_deadline(df)
+    if not columns_to_check:
+        df["Has Missing Information"] = False
+        return df
+
+    missing_flags = []
+
+    for _, row in df.iterrows():
+        row_has_missing = False
+
+        for column in columns_to_check:
+            value = row[column]
+
+            # A blank Deadline is acceptable when a Deadline Type exists.
+            if column == "Deadline":
+                if pd.isna(value) and pd.notna(row.get("Deadline Type")):
+                    continue
+
+            # Deadline Type itself can be blank when a fixed date exists.
+            if column == "Deadline Type":
+                if pd.isna(value) and pd.notna(row.get("Deadline")):
+                    continue
+
+            if pd.isna(value):
+                row_has_missing = True
+                break
+
+            if isinstance(value, str) and not value.strip():
+                row_has_missing = True
+                break
+
+        missing_flags.append(row_has_missing)
+
+    df["Has Missing Information"] = missing_flags
 
     return df
 
@@ -411,60 +206,60 @@ def clean_data(df):
 
 @st.cache_data
 def load_data():
+    # Read the first worksheet.
+    excel_file = pd.ExcelFile(DATA_FILE)
+    sheet_name = excel_file.sheet_names[0]
+
     df = pd.read_excel(
-        "data/Grant Database - Backup.xlsx"
+        DATA_FILE,
+        sheet_name=sheet_name,
     )
 
-    # Remove spaces from Excel column names.
-    df.columns = df.columns.str.strip()
+    # Standardize header spacing only.
+    df.columns = (
+        df.columns
+        .astype(str)
+        .str.strip()
+    )
 
     # Remove completely empty rows.
     df = df.dropna(
         how="all"
     ).reset_index(drop=True)
 
-    # Run data cleaning.
-    df = clean_data(df)
+    # Lightweight whitespace cleanup only.
+    for column in df.columns:
+        if column != "Deadline":
+            df[column] = (
+                clean_text(df[column])
+                if df[column].dtype == "object"
+                or str(df[column].dtype).startswith("string")
+                else df[column]
+            )
 
-    # Columns used to determine whether a record is incomplete.
-    original_columns = [
-        "Funder Name",
-        "Program Name",
-        "Website Link",
-        "Funding Type",
-        "Focus Area",
-        "Grant Size",
-        "Eligibility",
-        "Deadline",
-        "Geographic Scope",
-        "Notes (Fit with Medica Zone's Mission)",
-    ]
+    # Replace visible Excel hyperlink labels with real URLs.
+    website_links = extract_excel_hyperlinks(
+        DATA_FILE,
+        sheet_name,
+    )
 
-    # Only use columns that actually exist in the spreadsheet.
-    available_original_columns = [
-        column
-        for column in original_columns
-        if column in df.columns
-    ]
-
-    if available_original_columns:
-        df["Has Missing Information"] = (
-            df[available_original_columns]
-            .replace(r"^\s*$", pd.NA, regex=True)
-            .isna()
-            .any(axis=1)
+    if "Website Link" in df.columns and website_links:
+        df["Website Link"] = pd.Series(
+            website_links[: len(df)],
+            dtype="string",
         )
-    else:
-        df["Has Missing Information"] = False
+
+    df = prepare_deadlines(df)
+    df = add_missing_information_flag(df)
 
     return df
 
-st.cache_data.clear()
+
 df = load_data()
 
 
 # --------------------------------------------------
-# Title
+# Header
 # --------------------------------------------------
 
 st.title("Grant Opportunity Explorer")
@@ -476,19 +271,26 @@ st.caption(
 
 
 # --------------------------------------------------
-# KPI calculations
+# KPI cards
 # --------------------------------------------------
 
 total_grants = len(df)
 
-incomplete_grants = int(
-    df["Has Missing Information"].sum()
+funding_type_count = (
+    df["Funding Type"].nunique(dropna=True)
+    if "Funding Type" in df.columns
+    else 0
 )
 
+focus_area_count = (
+    df["Focus Area"].nunique(dropna=True)
+    if "Focus Area" in df.columns
+    else 0
+)
 
-# --------------------------------------------------
-# KPI cards
-# --------------------------------------------------
+missing_count = int(
+    df["Has Missing Information"].sum()
+)
 
 k1, k2, k3, k4 = st.columns(4)
 
@@ -499,24 +301,21 @@ k1.metric(
 
 k2.metric(
     "Funding Types",
-    df["Funding Type"].nunique(dropna=True)
-    if "Funding Type" in df.columns
-    else 0,
+    funding_type_count,
 )
 
 k3.metric(
     "Focus Areas",
-    df["Focus Area"].nunique(dropna=True)
-    if "Focus Area" in df.columns
-    else 0,
+    focus_area_count,
 )
 
 k4.metric(
     "Records with Missing Fields",
-    incomplete_grants,
+    missing_count,
     help=(
-        "Number of grant records with at least one blank field. "
-        "This is a data-quality count, not a completion rate."
+        "Number of grant records with at least one missing core field. "
+        "A blank deadline is not counted as missing when a valid "
+        "Deadline Type such as Rolling or Varies is provided."
     ),
 )
 
@@ -529,67 +328,62 @@ st.divider()
 
 st.subheader("Explore Grants")
 
-
-funding_options = []
-
-if "Funding Type" in df.columns:
-    funding_options = sorted(
+funding_options = (
+    sorted(
         df["Funding Type"]
         .dropna()
         .astype(str)
         .unique()
         .tolist()
     )
+    if "Funding Type" in df.columns
+    else []
+)
 
-
-focus_options = []
-
-if "Focus Area" in df.columns:
-    focus_options = sorted(
+focus_options = (
+    sorted(
         df["Focus Area"]
         .dropna()
         .astype(str)
         .unique()
         .tolist()
     )
+    if "Focus Area" in df.columns
+    else []
+)
 
-
-deadline_options = [
-    "Due within 7 days",
-    "Due within 30 days",
-    "Due within 90 days",
-    "More than 90 days",
-    "No fixed date",
-    "Missing deadline",
-    "Past deadline",
-]
-
+deadline_options = (
+    sorted(
+        df["Deadline Status"]
+        .dropna()
+        .astype(str)
+        .unique()
+        .tolist()
+    )
+    if "Deadline Status" in df.columns
+    else []
+)
 
 f1, f2, f3 = st.columns(3)
-
 
 selected_funding = f1.multiselect(
     "Funding Type",
     options=funding_options,
 )
 
-
 selected_focus = f2.multiselect(
     "Focus Area",
     options=focus_options,
 )
-
 
 selected_deadline_status = f3.multiselect(
     "Deadline Status",
     options=deadline_options,
 )
 
-
 show_missing = st.checkbox(
     "Show only grants with missing information"
 )
-
 
 search_term = st.text_input(
     "Search grants",
@@ -606,14 +400,12 @@ search_term = st.text_input(
 
 filtered_df = df.copy()
 
-
 if selected_funding and "Funding Type" in filtered_df.columns:
     filtered_df = filtered_df[
         filtered_df["Funding Type"].isin(
             selected_funding
         )
     ]
-
 
 if selected_focus and "Focus Area" in filtered_df.columns:
     filtered_df = filtered_df[
@@ -622,23 +414,17 @@ if selected_focus and "Focus Area" in filtered_df.columns:
         )
     ]
 
-
-if (
-    selected_deadline_status
-    and "Deadline Status" in filtered_df.columns
-):
+if selected_deadline_status:
     filtered_df = filtered_df[
         filtered_df["Deadline Status"].isin(
             selected_deadline_status
         )
     ]
 
-
 if show_missing:
     filtered_df = filtered_df[
         filtered_df["Has Missing Information"]
     ]
-
 
 if search_term:
     searchable_columns = [
@@ -648,7 +434,7 @@ if search_term:
         "Focus Area",
         "Grant Size",
         "Eligibility",
-        "Deadline Display",
+        "Deadline Type",
         "Geographic Scope",
         "Notes (Fit with Medica Zone's Mission)",
     ]
@@ -675,8 +461,9 @@ if search_term:
             .any(axis=1)
         )
 
-        filtered_df = filtered_df[search_mask]
-
+        filtered_df = filtered_df[
+            search_mask
+        ]
 
 st.write(
     f"Showing **{len(filtered_df)}** of "
@@ -690,11 +477,6 @@ st.write(
 
 table_df = filtered_df.copy()
 
-
-# Replace the mixed Excel deadline with safe display text.
-table_df["Deadline"] = table_df["Deadline Display"]
-
-
 columns_to_show = [
     "Funder Name",
     "Program Name",
@@ -703,39 +485,43 @@ columns_to_show = [
     "Focus Area",
     "Grant Size",
     "Eligibility",
-    "Deadline",
+    "Deadline Display",
+    "Deadline Type",
     "Days Until Deadline",
     "Deadline Status",
     "Geographic Scope",
     "Notes (Fit with Medica Zone's Mission)",
 ]
 
-
-# Only show columns that exist.
 columns_to_show = [
     column
     for column in columns_to_show
     if column in table_df.columns
 ]
 
+table_df = table_df[
+    columns_to_show
+].copy()
 
-table_df = table_df[columns_to_show]
+table_df = table_df.rename(
+    columns={
+        "Deadline Display": "Deadline",
+        "Days Until Deadline": "Days Left",
+        "Notes (Fit with Medica Zone's Mission)": "Mission Fit Notes",
+    }
+)
 
-
-# Convert text columns safely without turning missing values into "nan".
 text_columns = [
     column
     for column in table_df.columns
-    if column != "Days Until Deadline"
+    if column != "Days Left"
 ]
-
 
 table_df[text_columns] = (
     table_df[text_columns]
     .fillna("")
     .astype(str)
 )
-
 
 st.dataframe(
     table_df,
@@ -746,15 +532,13 @@ st.dataframe(
             "Website Link",
             display_text="Open grant page",
         ),
-        "Days Until Deadline": st.column_config.NumberColumn(
+        "Days Left": st.column_config.NumberColumn(
             "Days Left",
             format="%d",
         ),
-        "Notes (Fit with Medica Zone's Mission)": (
-            st.column_config.TextColumn(
-                "Mission Fit Notes",
-                width="large",
-            )
+        "Mission Fit Notes": st.column_config.TextColumn(
+            "Mission Fit Notes",
+            width="large",
         ),
     },
 )
@@ -764,13 +548,9 @@ st.dataframe(
 # Download filtered results
 # --------------------------------------------------
 
-download_df = table_df.copy()
-
-
-csv_data = download_df.to_csv(
+csv_data = table_df.to_csv(
     index=False
 ).encode("utf-8-sig")
-
 
 st.download_button(
     label="Download Filtered Results as CSV",
@@ -778,7 +558,6 @@ st.download_button(
     file_name="filtered_grant_opportunities.csv",
     mime="text/csv",
 )
-
 
 st.divider()
 
@@ -789,62 +568,27 @@ st.divider()
 
 st.subheader("Grant Portfolio Overview")
 
+# Keep the chart narrower so it is easier to read.
+chart_col, empty_col = st.columns([3, 2])
 
-chart_left, chart_right = st.columns(2)
-
-
-with chart_left:
+with chart_col:
     st.markdown("#### Grants by Funding Type")
 
-    if "Funding Type" in filtered_df.columns:
-        funding_chart = (
-            filtered_df["Funding Type"]
-            .fillna("Missing")
-            .astype(str)
-            .value_counts()
-            .rename_axis("Funding Type")
-            .reset_index(name="Number of Grants")
-        )
+    funding_chart = (
+        filtered_df["Funding Type"]
+        .fillna("Missing")
+        .astype(str)
+        .value_counts()
+        .rename_axis("Funding Type")
+        .reset_index(name="Number of Grants")
+    )
 
-        if funding_chart.empty:
-            st.info(
-                "No data available for the current filters."
-            )
-        else:
-            st.bar_chart(
-                funding_chart,
-                x="Funding Type",
-                y="Number of Grants",
-                width="stretch",
-            )
+    if funding_chart.empty:
+        st.info("No data available for the current filters.")
     else:
-        st.info("Funding Type column is unavailable.")
-
-
-with chart_right:
-    st.markdown("#### Grants by Focus Area")
-
-    if "Focus Area" in filtered_df.columns:
-        focus_chart = (
-            filtered_df["Focus Area"]
-            .fillna("Missing")
-            .astype(str)
-            .value_counts()
-            .rename_axis("Focus Area")
-            .reset_index(name="Number of Grants")
+        st.bar_chart(
+            funding_chart,
+            x="Funding Type",
+            y="Number of Grants",
+            width="stretch",
         )
-
-        if focus_chart.empty:
-            st.info(
-                "No data available for the current filters."
-            )
-        else:
-            st.bar_chart(
-                focus_chart,
-                x="Focus Area",
-                y="Number of Grants",
-                horizontal=True,
-                width="stretch",
-            )
-    else:
-        st.info("Focus Area column is unavailable.")
